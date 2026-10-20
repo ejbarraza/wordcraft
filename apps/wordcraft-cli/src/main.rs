@@ -103,9 +103,10 @@ fn open(path: &Path, password: Option<&str>) -> Result<Session, String> {
 /// `Failure::AuditError` (exit 2) when the audit itself cannot run.
 fn audit(path: &Path) -> Result<(), Failure> {
     let bytes = std::fs::read(path).map_err(|e| Failure::AuditError(format!("audit: cannot read {}: {e}", path.display())))?;
-    let findings = wordcraft_audit::audit_bytes(&bytes).map_err(|e| Failure::AuditError(format!("audit: {}: {e}", path.display())))?;
-    let report = serde_json::json!({ "file": path.display().to_string(), "findings": findings, "count": findings.len() });
-    let text = serde_json::to_string_pretty(&report).unwrap_or_default();
+    let report = wordcraft_audit::audit_report(&bytes).map_err(|e| Failure::AuditError(format!("audit: {}: {e}", path.display())))?;
+    let findings = &report.findings;
+    let json = serde_json::json!({ "file": path.display().to_string(), "findings": findings, "count": findings.len(), "scanned": report.scanned, "not_scanned": report.not_scanned });
+    let text = serde_json::to_string_pretty(&json).unwrap_or_default();
     write_stdout(|o| writeln!(o, "{text}"))?;
     if findings.is_empty() { Ok(()) } else { Err(Failure::Findings(findings.len())) }
 }

@@ -4,7 +4,7 @@
 
 use std::io::{Cursor, Write};
 
-use crate::{AuditError, FindingKind, audit_bytes};
+use crate::{AuditError, FindingKind, audit_bytes, audit_report};
 
 const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const RELS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
@@ -73,6 +73,7 @@ fn finding_ids_are_stable() {
     let ids: Vec<(&str, FindingKind)> = vec![
         ("author-pii/revision", FindingKind::RevisionAuthor),
         ("author-pii/comment", FindingKind::CommentAuthor),
+        ("author-pii/people", FindingKind::PeopleAuthor),
         ("author-pii/core-properties", FindingKind::CorePropertiesAuthor),
         ("author-pii/extended-properties", FindingKind::ExtendedProperties),
         ("hidden-text", FindingKind::HiddenText),
@@ -491,4 +492,170 @@ fn whitespace_outside_root_is_accepted() {
         ("word/_rels/document.xml.rels", &doc_rels("")),
     ]);
     assert!(findings_of(&bytes).is_empty());
+}
+
+#[test]
+fn footnote_tracked_change_found() {
+    // The review case for story-part coverage: a document whose ONLY
+    // tracked change sits in a footnote must not report clean.
+    let footnotes = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><w:footnotes xmlns:w="{W}"><w:footnote w:id="1"><w:p><w:ins w:id="2" w:author="Quill Ramsey"><w:r><w:t>Added in a note</w:t></w:r></w:ins></w:p></w:footnote></w:footnotes>"#
+    );
+    let rels = doc_rels(
+        r#"<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes" Target="footnotes.xml"/>"#,
+    );
+    let bytes = package(&[
+        ("[Content_Types].xml", &content_types()),
+        ("_rels/.rels", &root_rels()),
+        ("word/document.xml", &plain_paragraph()),
+        ("word/_rels/document.xml.rels", &rels),
+        ("word/footnotes.xml", &footnotes.into_bytes()),
+    ]);
+    let findings = findings_of(&bytes);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].id, "author-pii/revision");
+    assert_eq!(findings[0].location, "word/footnotes.xml <w:ins>");
+    assert!(findings[0].detail.contains("Quill Ramsey"));
+}
+
+#[test]
+fn header_hidden_text_found() {
+    // Headers are story parts too: a `w:vanish` run there hides text.
+    let header = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><w:hdr xmlns:w="{W}"><w:p><w:r><w:rPr><w:vanish/></w:rPr><w:t>Draft</w:t></w:r></w:p></w:hdr>"#
+    );
+    let rels = doc_rels(
+        r#"<Relationship Id="rId6" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>"#,
+    );
+    let bytes = package(&[
+        ("[Content_Types].xml", &content_types()),
+        ("_rels/.rels", &root_rels()),
+        ("word/document.xml", &plain_paragraph()),
+        ("word/_rels/document.xml.rels", &rels),
+        ("word/header1.xml", &header.into_bytes()),
+    ]);
+    let findings = findings_of(&bytes);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].id, "hidden-text");
+    assert_eq!(findings[0].location, "word/header1.xml <w:vanish>");
+}
+
+#[test]
+fn people_part_authors_found() {
+    // `word/people.xml` is the comment-author roster: names survive even
+    // when the comments themselves are gone.
+    let people = br#"<?xml version="1.0" encoding="UTF-8"?><w15:people xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml"><w15:person w15:author="Quill Ramsey" w15:presenceInfoId="42"/></w15:people>"#;
+    let rels = doc_rels(r#"<Relationship Id="rId7" Type="http://schemas.microsoft.com/office/2011/relationships/people" Target="people.xml"/>"#);
+    let bytes = package(&[
+        ("[Content_Types].xml", &content_types()),
+        ("_rels/.rels", &root_rels()),
+        ("word/document.xml", &plain_paragraph()),
+        ("word/_rels/document.xml.rels", &rels),
+        ("word/people.xml", people),
+    ]);
+    let findings = findings_of(&bytes);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].id, "author-pii/people");
+    assert!(findings[0].detail.contains("Quill Ramsey"));
+}
+
+#[test]
+fn custom_properties_identity_names_found() {
+    // Only identity-named custom properties are metadata leakage; other
+    // properties are the author's own content and stay unreported.
+    let custom = br#"<?xml version="1.0" encoding="UTF-8"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="2" name="Author"><vt:lpwstr>Quill Ramsey</vt:lpwstr></property><property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="3" name="DocumentNumber"><vt:lpwstr>42</vt:lpwstr></property></Properties>"#;
+    let rels = root_rels_with(
+        r#"<Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties" Target="docProps/custom.xml"/>"#,
+    );
+    let bytes = package(&[
+        ("[Content_Types].xml", &content_types()),
+        ("_rels/.rels", &rels),
+        ("word/document.xml", &plain_paragraph()),
+        ("word/_rels/document.xml.rels", &doc_rels("")),
+        ("docProps/custom.xml", custom),
+    ]);
+    let findings = findings_of(&bytes);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].id, "author-pii/core-properties");
+    assert!(findings[0].location.contains("docProps/custom.xml"));
+    assert_eq!(findings[0].detail, "Quill Ramsey");
+}
+
+#[test]
+fn report_lists_scan_coverage() {
+    // A part the audit does not parse (here a theme) is listed as not
+    // scanned, so "clean" always shows what it covered.
+    let rels = doc_rels(
+        r#"<Relationship Id="rId8" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/>"#,
+    );
+    let bytes = package(&[
+        ("[Content_Types].xml", &content_types()),
+        ("_rels/.rels", &root_rels()),
+        ("word/document.xml", &plain_paragraph()),
+        ("word/_rels/document.xml.rels", &rels),
+        ("word/theme/theme1.xml", br#"<?xml version="1.0"?><a:theme/>"#),
+    ]);
+    let report = audit_report(&bytes).unwrap();
+    assert!(report.findings.is_empty());
+    assert!(report.scanned.contains(&"word/document.xml".to_string()));
+    assert!(report.scanned.contains(&"_rels/.rels".to_string()));
+    assert!(!report.scanned.contains(&"word/theme/theme1.xml".to_string()));
+    assert!(report.not_scanned.contains(&"word/theme/theme1.xml".to_string()));
+}
+
+#[test]
+fn percent_encoded_target_is_not_an_orphan() {
+    // Relationship targets are URIs: `image%201.png` names the part
+    // `word/media/image 1.png` (OPC part names vs URI escaping).
+    let rels = doc_rels(
+        r#"<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image%201.png"/>"#,
+    );
+    let bytes = package(&[
+        ("[Content_Types].xml", &content_types()),
+        ("_rels/.rels", &root_rels()),
+        ("word/document.xml", &plain_paragraph()),
+        ("word/_rels/document.xml.rels", &rels),
+        ("word/media/image 1.png", b"fake-png-bytes"),
+    ]);
+    assert!(findings_of(&bytes).is_empty());
+}
+
+#[test]
+fn case_variant_target_is_not_an_orphan() {
+    // OPC part names are case-insensitive: `Media/Image1.PNG` reaches
+    // `word/media/image1.png`.
+    let rels = doc_rels(
+        r#"<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="Media/Image1.PNG"/>"#,
+    );
+    let bytes = package(&[
+        ("[Content_Types].xml", &content_types()),
+        ("_rels/.rels", &root_rels()),
+        ("word/document.xml", &plain_paragraph()),
+        ("word/_rels/document.xml.rels", &rels),
+        ("word/media/image1.png", b"fake-png-bytes"),
+    ]);
+    assert!(findings_of(&bytes).is_empty());
+}
+
+#[test]
+fn control_characters_in_values_are_sanitized() {
+    // A hostile file can smuggle control characters into a reported value
+    // (here via CDATA in `dc:creator`); the report replaces them with
+    // U+FFFD so printing the report cannot spoof a terminal.
+    let core = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:creator><![CDATA[Quill\u{7}Ramsey]]></dc:creator></cp:coreProperties>";
+    let rels = root_rels_with(
+        r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>"#,
+    );
+    let bytes = package(&[
+        ("[Content_Types].xml", &content_types()),
+        ("_rels/.rels", &rels),
+        ("word/document.xml", &plain_paragraph()),
+        ("word/_rels/document.xml.rels", &doc_rels("")),
+        ("docProps/core.xml", core.as_bytes()),
+    ]);
+    let findings = findings_of(&bytes);
+    assert_eq!(findings.len(), 1);
+    assert!(!findings[0].detail.contains('\u{7}'), "raw control char survived: {:?}", findings[0].detail);
+    assert!(findings[0].detail.contains('\u{fffd}'));
+    assert!(findings[0].detail.contains("Quill"));
 }

@@ -8,9 +8,10 @@ of the file could learn about its authors.
 
 | ID | Severity | What |
 |---|---|---|
-| `author-pii/revision` | warn | `w:author`/`w:initials` on tracked-change elements: `w:ins`/`w:del`, moves, table revisions, custom XML markers, and tracked property changes (`w:rPrChange`, `w:pPrChange`, `w:sectPrChange`, `w:tblPrChange`, `w:tblPrExChange`, `w:trPrChange`, `w:tcPrChange`, `w:numberingChange`). Never `w:tblGridChange` or `*RangeEnd` markers (no `w:author` in their types) |
+| `author-pii/revision` | warn | `w:author`/`w:initials` on tracked-change elements: `w:ins`/`w:del`, moves, table revisions, custom XML markers, and tracked property changes (`w:rPrChange`, `w:pPrChange`, `w:sectPrChange`, `w:tblPrChange`, `w:tblPrExChange`, `w:trPrChange`, `w:tcPrChange`, `w:numberingChange`). Never `w:tblGridChange` or `*RangeEnd` markers (no `w:author` in their types). Scanned in every story part: `word/document.xml`, `word/header*.xml`, `word/footer*.xml`, `word/footnotes.xml`, `word/endnotes.xml` |
 | `author-pii/comment` | warn | `w:author`/`w:initials`/`w:date` on `w:comment` |
-| `author-pii/core-properties` | warn | `dc:creator` / `cp:lastModifiedBy` in `docProps/core.xml` |
+| `author-pii/people` | warn | `w15:author` on `w15:person` in `word/people.xml` (the comment-author roster) |
+| `author-pii/core-properties` | warn | `dc:creator` / `cp:lastModifiedBy` in `docProps/core.xml`; identity-named properties (`Author`, `Creator`, `Owner`, …) in `docProps/custom.xml` |
 | `author-pii/extended-properties` | info | `Company` / `Manager` in `docProps/app.xml` |
 | `hidden-text` | warn | `w:vanish` run properties (text that renders hidden) |
 | `active-content/vba` | warn | VBA macro project: by relationship type, or a `word/vbaProject.bin` part |
@@ -43,9 +44,16 @@ is reported, never blocked. Sanitizing is a separate, future step.
       "detail": "author=\"Quill Ramsey\" initials=\"QR\""
     }
   ],
-  "count": 1
+  "count": 1,
+  "scanned": ["_rels/.rels", "docProps/core.xml", "word/document.xml"],
+  "not_scanned": ["word/theme/theme1.xml"]
 }
 ```
+
+The report always lists the parts it `scanned` and the parts it did not,
+so a zero-finding result shows exactly what "clean" covered. Values copied
+out of the file (author names, part names) have control characters
+replaced with U+FFFD, so printing a report cannot spoof a terminal.
 
 Exit codes: `0` = no findings, `1` = findings present (CI-gate usable),
 `2` = the audit could not run (unreadable file, unparsable package).
@@ -56,14 +64,16 @@ Exit codes: `0` = no findings, `1` = findings present (CI-gate usable),
   excluded — its type defines no `w:author`), `w:comment` (§17.13.4.2),
   `w:vanish` (§17.3.2.42), `ST_OnOff` (§17.18.67)
 - ECMA-376 Part 2: core properties (§12.3.1), extended properties (§12.3.2),
-  OPC relationships (§12.2.4)
+  custom properties (§12.3.3), OPC relationships (§12.2.4), part names are
+  case-insensitive (§9.1.1)
 
 ## Limits
 
-- Only `word/document.xml` is scanned for revisions and hidden text in v1;
-  headers, footers, footnotes and endnotes can carry the same constructs.
+- Story parts are scanned by their standard part names; a story part at a
+  non-standard path is not parsed, but it is never invisible — it appears
+  in the report's `not_scanned` list, as does every other unparsed part.
 - A part that cannot be parsed is an error, never a silent pass (fail closed).
   Malformed XML (mismatched or unclosed tags) fails the audit.
 - Hostile-input guards: at most 100,000 ZIP entries, 256 MiB per part,
-  1 GiB total decompressed bytes across all scanned parts,
+  256 MiB total decompressed bytes across all scanned parts,
   2,000,000 XML elements per part.

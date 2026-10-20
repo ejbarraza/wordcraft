@@ -14,8 +14,11 @@
 //!   WordprocessingML namespace with an unusual prefix is still scanned.
 //! - `w:vanish` hides text only when its `w:val` is absent or true-ish
 //!   (ECMA-376 §17.18.67 `ST_OnOff`); `w:val="false"` is not flagged.
-//! - Only `word/document.xml` is scanned for revisions and hidden text in v1;
-//!   headers, footers, footnotes and endnotes can carry the same constructs.
+//! - Revisions and hidden text are scanned in every story part:
+//!   `word/document.xml`, `word/header*.xml`, `word/footer*.xml`,
+//!   `word/footnotes.xml` and `word/endnotes.xml`. The report lists the
+//!   parts it scanned and the parts it did not, so "no findings" never
+//!   silently means "not looked at".
 //! - A `dc:creator` / `cp:lastModifiedBy` value is reported as-is; producers
 //!   that anonymize (WordCraft writes `Author`) are reported too, since the
 //!   value is what a recipient sees.
@@ -42,6 +45,8 @@ const NS_W: &[u8] = b"http://schemas.openxmlformats.org/wordprocessingml/2006/ma
 const NS_DC: &[u8] = b"http://purl.org/dc/elements/1.1/";
 const NS_CP: &[u8] = b"http://schemas.openxmlformats.org/package/2006/metadata/core-properties";
 const NS_EP: &[u8] = b"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties";
+const NS_CUST: &[u8] = b"http://schemas.openxmlformats.org/officeDocument/2006/custom-properties";
+const NS_W15: &[u8] = b"http://schemas.microsoft.com/office/word/2012/wordml";
 const NS_RELS: &[u8] = b"http://schemas.openxmlformats.org/package/2006/relationships";
 
 /// Cap on ZIP entries read: a package is a handful of parts, not millions.
@@ -49,8 +54,10 @@ const MAX_PARTS: usize = 100_000;
 /// Cap on decompressed bytes read from a single part (zip-bomb guard).
 const MAX_PART_BYTES: u64 = 256 * 1024 * 1024;
 /// Cap on total decompressed bytes across all scanned parts. Per-part caps
-/// alone don't bound N parts that each compress well (zip-bomb guard).
-const MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+/// alone don't bound N parts that each compress well (zip-bomb guard), and
+/// every scanned part is buffered, so the total also bounds audit memory.
+/// 256 MiB matches the per-part cap and is far above real packages.
+const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 /// Cap on XML elements walked in a single part.
 const MAX_XML_ELEMENTS: u64 = 2_000_000;
 
@@ -66,6 +73,9 @@ pub enum FindingKind {
     RevisionAuthor,
     /// `w:author`/`w:initials`/`w:date` on a `w:comment` (ECMA-376 §17.13.4.2).
     CommentAuthor,
+    /// `w15:author` on a `w15:person` in `word/people.xml`: the roster of
+    /// comment author names Word keeps for threaded comments.
+    PeopleAuthor,
     /// `dc:creator` / `cp:lastModifiedBy` in `docProps/core.xml`
     /// (ECMA-376 Part 2 §12.3.1).
     CorePropertiesAuthor,
@@ -89,6 +99,7 @@ impl FindingKind {
         match self {
             FindingKind::RevisionAuthor => "author-pii/revision",
             FindingKind::CommentAuthor => "author-pii/comment",
+            FindingKind::PeopleAuthor => "author-pii/people",
             FindingKind::CorePropertiesAuthor => "author-pii/core-properties",
             FindingKind::ExtendedProperties => "author-pii/extended-properties",
             FindingKind::HiddenText => "hidden-text",
@@ -103,6 +114,7 @@ impl FindingKind {
         match self {
             FindingKind::RevisionAuthor => "author name on tracked change",
             FindingKind::CommentAuthor => "author name on comment",
+            FindingKind::PeopleAuthor => "author name in people part",
             FindingKind::CorePropertiesAuthor => "author name in document properties",
             FindingKind::ExtendedProperties => "organization name in extended properties",
             FindingKind::HiddenText => "hidden text",
@@ -140,8 +152,24 @@ pub struct AuditFinding {
 
 impl AuditFinding {
     fn new(kind: FindingKind, location: String, detail: String) -> AuditFinding {
-        AuditFinding { id: kind.id().to_string(), title: kind.title().to_string(), severity: kind.severity().to_string(), location, detail }
+        AuditFinding {
+            id: kind.id().to_string(),
+            title: kind.title().to_string(),
+            severity: kind.severity().to_string(),
+            location: sanitize_report_text(&location),
+            detail: sanitize_report_text(&detail),
+        }
     }
+}
+
+/// Report strings carry values copied out of an untrusted file (author
+/// names, property values, part names). Control characters in them could
+/// spoof terminal output or forge log lines for whoever prints the report,
+/// so they are replaced with U+FFFD at this single construction point.
+/// (serde_json escapes them in JSON output; plain-text printers get the
+/// same safety.)
+fn sanitize_report_text(text: &str) -> String {
+    if text.chars().any(char::is_control) { text.chars().map(|c| if c.is_control() { '\u{fffd}' } else { c }).collect() } else { text.to_string() }
 }
 
 /// Why the audit could not run.
@@ -158,12 +186,33 @@ pub enum AuditError {
     Limit(String),
 }
 
-/// Scan the raw `.docx` (OPC ZIP) bytes and return every finding.
+/// The full audit result: the findings, plus which package parts were
+/// scanned to produce them and which were present but not scanned. The
+/// coverage lists are part of the result because "no findings" is only
+/// meaningful next to what the scan actually covered.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AuditReport {
+    /// Every finding, in deterministic order (by class, location, detail).
+    pub findings: Vec<AuditFinding>,
+    /// Package parts the audit read and parsed, sorted.
+    pub scanned: Vec<String>,
+    /// Package parts present in the file but not parsed, sorted. Listed so
+    /// a clean result never silently hides unexamined content.
+    pub not_scanned: Vec<String>,
+}
+
+/// Scan the raw `.docx` (OPC ZIP) bytes and return the findings.
 ///
 /// Findings come back in a deterministic order (by class, location, detail).
 /// Fails closed: unreadable or unparsable input is an [`AuditError`], never an
 /// empty finding list that looks like a clean bill of health.
 pub fn audit_bytes(bytes: &[u8]) -> Result<Vec<AuditFinding>, AuditError> {
+    Ok(audit_report(bytes)?.findings)
+}
+
+/// Scan the raw `.docx` (OPC ZIP) bytes and return the full report,
+/// including scan coverage (see [`AuditReport`]).
+pub fn audit_report(bytes: &[u8]) -> Result<AuditReport, AuditError> {
     // One archive for the whole scan: re-opening it per part would re-parse
     // the central directory each time (quadratic on hostile input).
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| AuditError::Zip(e.to_string()))?;
@@ -175,14 +224,21 @@ pub fn audit_bytes(bytes: &[u8]) -> Result<Vec<AuditFinding>, AuditError> {
         parts.insert(name.clone(), data);
     }
 
-    let mut findings = Vec::new();
-    if let Some(xml) = parts.get("word/document.xml") {
-        scan_revisions_and_hidden_text(xml, &mut findings)?;
-    } else {
+    if !parts.contains_key("word/document.xml") {
         return Err(AuditError::Xml("word/document.xml".to_string(), "missing: not a Word document package".to_string()));
+    }
+    let mut findings = Vec::new();
+    // BTreeMap iteration is sorted, so story parts scan in a stable order.
+    for (name, xml) in &parts {
+        if is_story_part(name) {
+            scan_story_part(xml, name, &mut findings)?;
+        }
     }
     if let Some(xml) = parts.get("word/comments.xml") {
         scan_comments(xml, &mut findings)?;
+    }
+    if let Some(xml) = parts.get("word/people.xml") {
+        scan_people(xml, &mut findings)?;
     }
     if let Some(xml) = parts.get("docProps/core.xml") {
         scan_core_properties(xml, &mut findings)?;
@@ -190,16 +246,40 @@ pub fn audit_bytes(bytes: &[u8]) -> Result<Vec<AuditFinding>, AuditError> {
     if let Some(xml) = parts.get("docProps/app.xml") {
         scan_extended_properties(xml, &mut findings)?;
     }
+    if let Some(xml) = parts.get("docProps/custom.xml") {
+        scan_custom_properties(xml, &mut findings)?;
+    }
     scan_active_content(&names, &parts, &mut findings)?;
     scan_orphans(&names, &parts, &mut findings)?;
 
     findings.sort_by(|a, b| (&a.id, &a.location, &a.detail).cmp(&(&b.id, &b.location, &b.detail)));
-    Ok(findings)
+    let scanned: Vec<String> = parts.keys().cloned().collect();
+    let not_scanned: Vec<String> = names.iter().filter(|n| !parts.contains_key(*n)).cloned().collect();
+    Ok(AuditReport { findings, scanned, not_scanned })
 }
 
-/// Parts the audit parses as XML. Everything else is only listed by name.
+/// Parts the audit parses as XML. Everything else is only listed by name
+/// (and reported under [`AuditReport::not_scanned`]).
 fn is_scanned_part(name: &str) -> bool {
-    name == "word/document.xml" || name == "word/comments.xml" || name == "docProps/core.xml" || name == "docProps/app.xml" || name.ends_with(".rels")
+    is_story_part(name)
+        || name == "word/comments.xml"
+        || name == "word/people.xml"
+        || name == "docProps/core.xml"
+        || name == "docProps/app.xml"
+        || name == "docProps/custom.xml"
+        || name.ends_with(".rels")
+}
+
+/// Story parts carry the document text — and with it, tracked changes and
+/// hidden text: the main document, headers, footers, footnotes, endnotes.
+fn is_story_part(name: &str) -> bool {
+    if name == "word/document.xml" || name == "word/footnotes.xml" || name == "word/endnotes.xml" {
+        return true;
+    }
+    match name.strip_prefix("word/") {
+        Some(file) => (file.starts_with("header") || file.starts_with("footer")) && file.ends_with(".xml"),
+        None => false,
+    }
 }
 
 /// Every non-directory entry name in the ZIP, in archive order.
@@ -492,9 +572,10 @@ const REVISION_ELEMENTS: &[&str] = &[
     "numberingChange",
 ];
 
-/// Author-bearing revision elements and `w:vanish` runs in `word/document.xml`.
-fn scan_revisions_and_hidden_text(xml: &[u8], findings: &mut Vec<AuditFinding>) -> Result<(), AuditError> {
-    for_each_element(xml, "word/document.xml", &mut |el| {
+/// Author-bearing revision elements and `w:vanish` runs in one story part
+/// (`word/document.xml`, a header/footer, footnotes or endnotes).
+fn scan_story_part(xml: &[u8], part: &str, findings: &mut Vec<AuditFinding>) -> Result<(), AuditError> {
+    for_each_element(xml, part, &mut |el| {
         if el.ns.as_slice() != NS_W {
             return Ok(());
         }
@@ -508,7 +589,7 @@ fn scan_revisions_and_hidden_text(xml: &[u8], findings: &mut Vec<AuditFinding>) 
                 {
                     detail.push_str(&format!(" initials=\"{initials}\""));
                 }
-                findings.push(AuditFinding::new(FindingKind::RevisionAuthor, format!("word/document.xml <w:{}>", el.local), detail));
+                findings.push(AuditFinding::new(FindingKind::RevisionAuthor, format!("{part} <w:{}>", el.local), detail));
             }
             return Ok(());
         }
@@ -520,11 +601,7 @@ fn scan_revisions_and_hidden_text(xml: &[u8], findings: &mut Vec<AuditFinding>) 
                 Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "false" | "off" | "0" | "f" | "no"),
             };
             if hidden {
-                findings.push(AuditFinding::new(
-                    FindingKind::HiddenText,
-                    "word/document.xml <w:vanish>".to_string(),
-                    "run property hides text".to_string(),
-                ));
+                findings.push(AuditFinding::new(FindingKind::HiddenText, format!("{part} <w:vanish>"), "run property hides text".to_string()));
             }
         }
         Ok(())
@@ -556,6 +633,22 @@ fn scan_comments(xml: &[u8], findings: &mut Vec<AuditFinding>) -> Result<(), Aud
     })
 }
 
+/// `w15:person` author names in `word/people.xml`: the roster Word keeps of
+/// everyone who has commented, names included even when the comments
+/// themselves were later deleted.
+fn scan_people(xml: &[u8], findings: &mut Vec<AuditFinding>) -> Result<(), AuditError> {
+    for_each_element(xml, "word/people.xml", &mut |el| {
+        if el.ns.as_slice() == NS_W15
+            && el.local == "person"
+            && let Some(author) = attr(el, NS_W15, "author")
+            && !author.is_empty()
+        {
+            findings.push(AuditFinding::new(FindingKind::PeopleAuthor, "word/people.xml <w15:person>".to_string(), format!("author=\"{author}\"")));
+        }
+        Ok(())
+    })
+}
+
 /// `dc:creator` / `cp:lastModifiedBy` in `docProps/core.xml`.
 fn scan_core_properties(xml: &[u8], findings: &mut Vec<AuditFinding>) -> Result<(), AuditError> {
     for (ns, local, element) in [(NS_DC, "creator", "dc:creator"), (NS_CP, "lastModifiedBy", "cp:lastModifiedBy")] {
@@ -581,6 +674,122 @@ fn scan_extended_properties(xml: &[u8], findings: &mut Vec<AuditFinding>) -> Res
         }
     }
     Ok(())
+}
+
+/// Identity-named properties in `docProps/custom.xml` (ECMA-376 Part 2
+/// §12.3.3). Custom properties are arbitrary name/value pairs, so only
+/// names that identify a person or organization are reported; the value of
+/// any other property is the author's own content, not metadata leakage.
+const CUSTOM_IDENTITY_NAMES: &[&str] = &[
+    "author",
+    "creator",
+    "created by",
+    "createdby",
+    "last modified by",
+    "lastmodifiedby",
+    "modified by",
+    "modifiedby",
+    "owner",
+    "editor",
+    "company",
+    "manager",
+];
+
+fn scan_custom_properties(xml: &[u8], findings: &mut Vec<AuditFinding>) -> Result<(), AuditError> {
+    let part = "docProps/custom.xml";
+    let mut reader = NsReader::from_reader(xml);
+    {
+        let config = reader.config_mut();
+        config.trim_text_start = false;
+        config.trim_text_end = false;
+        config.expand_empty_elements = false;
+        // See `for_each_element`: malformed parts fail the audit.
+        config.check_end_names = true;
+    }
+    let mut buf = Vec::new();
+    let mut count: u64 = 0;
+    let mut open: u32 = 0;
+    // Depth inside the `property` element currently open (0 = outside one),
+    // its `name` attribute, and its accumulated text (the value lives in a
+    // child element, e.g. `vt:lpwstr`).
+    let mut in_property: u32 = 0;
+    let mut current_name = String::new();
+    let mut current_value = String::new();
+    loop {
+        buf.clear();
+        let (resolution, event) = reader.read_resolved_event_into(&mut buf).map_err(|e| AuditError::Xml(part.to_string(), e.to_string()))?;
+        // Copy the namespace URI out so the reader borrow ends here; the
+        // attribute resolver in `element_of` needs `&mut reader` again.
+        let el_ns: Vec<u8> = match &resolution {
+            ResolveResult::Bound(n) => n.0.to_vec(),
+            _ => Vec::new(),
+        };
+        match event {
+            Event::Start(ref e) => {
+                open = open.saturating_add(1);
+                count += 1;
+                if count > MAX_XML_ELEMENTS {
+                    return Err(AuditError::Limit(format!("{part}: too many XML elements")));
+                }
+                if in_property == 0 && el_ns.as_slice() == NS_CUST && e.local_name().as_ref() == b"property" {
+                    let el = element_of(&mut reader, &el_ns, e, part)?;
+                    current_name = attr(&el, b"", "name").unwrap_or("").to_string();
+                    current_value.clear();
+                    in_property = 1;
+                } else if in_property > 0 {
+                    in_property = in_property.saturating_add(1);
+                }
+            }
+            Event::Empty(_) => {
+                open = open.saturating_add(1);
+                count += 1;
+                if count > MAX_XML_ELEMENTS {
+                    return Err(AuditError::Limit(format!("{part}: too many XML elements")));
+                }
+                // An empty element opens and closes at once; an empty
+                // `property` has no value to report.
+                open = open.saturating_sub(1);
+            }
+            Event::End(_) => {
+                open = open.saturating_sub(1);
+                if in_property > 0 {
+                    in_property -= 1;
+                    if in_property == 0 {
+                        report_custom_property(&current_name, &current_value, findings);
+                    }
+                }
+            }
+            Event::Text(ref t) => {
+                if in_property > 0 {
+                    let decoded = t.xml10_content().map(|v| v.into_owned()).unwrap_or_else(|_| String::from_utf8_lossy(t.as_ref()).into_owned());
+                    current_value.push_str(&decoded);
+                }
+            }
+            Event::CData(ref t) => {
+                if in_property > 0 {
+                    current_value.push_str(&String::from_utf8_lossy(t.as_ref()));
+                }
+            }
+            Event::Eof => {
+                if open != 0 {
+                    return Err(AuditError::Xml(part.to_string(), "unclosed elements at end of part".to_string()));
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Report one custom property when its name identifies a person or
+/// organization and its value is non-empty.
+fn report_custom_property(name: &str, value: &str, findings: &mut Vec<AuditFinding>) {
+    let value = value.trim();
+    if value.is_empty() || !CUSTOM_IDENTITY_NAMES.contains(&name.trim().to_ascii_lowercase().as_str()) {
+        return;
+    }
+    findings.push(AuditFinding::new(FindingKind::CorePropertiesAuthor, format!("docProps/custom.xml <property name=\"{name}\">"), value.to_string()));
 }
 
 /// Relationship types that mark active content: the VBA project part and
@@ -633,21 +842,32 @@ fn scan_active_content(names: &[String], parts: &BTreeMap<String, Vec<u8>>, find
 }
 
 /// ZIP entries no relationship targets: content nothing references.
-/// Reachability is computed lexically from every `*.rels` part; external
-/// relationship targets (`TargetMode="External"`) are not package parts.
+/// Reachability is computed by traversal from every reachable `*.rels`
+/// part; external relationship targets (`TargetMode="External"`) are not
+/// package parts. OPC part names are case-insensitive and relationship
+/// targets are URIs, so reachability compares normalized names
+/// (percent-decoded, ASCII-lowercased): a target spelled
+/// `Media/Image%201.png` reaches the part `word/media/image 1.png`.
 fn scan_orphans(names: &[String], parts: &BTreeMap<String, Vec<u8>>, findings: &mut Vec<AuditFinding>) -> Result<(), AuditError> {
-    // Reachability by traversal from the package root: only relationships in
-    // reachable parts count. A `.rels` file inside an orphaned subtree must
-    // not rescue its targets from orphan status.
-    let name_set: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+    // Normalized name -> the real part name / bytes, for lookups that must
+    // survive case and percent-encoding differences.
+    let mut original_by_norm: BTreeMap<String, &str> = BTreeMap::new();
+    for name in names {
+        original_by_norm.entry(normalize_part_name(name)).or_insert(name.as_str());
+    }
+    let mut parts_by_norm: BTreeMap<String, &Vec<u8>> = BTreeMap::new();
+    for (name, data) in parts {
+        parts_by_norm.entry(normalize_part_name(name)).or_insert(data);
+    }
     let mut reachable: BTreeSet<String> = BTreeSet::new();
-    reachable.insert("[Content_Types].xml".to_string());
+    reachable.insert(normalize_part_name("[Content_Types].xml"));
     let mut stack = vec!["_rels/.rels".to_string()];
     while let Some(rels_name) = stack.pop() {
-        if !name_set.contains(rels_name.as_str()) || !reachable.insert(rels_name.clone()) {
+        let rels_norm = normalize_part_name(&rels_name);
+        if !original_by_norm.contains_key(&rels_norm) || !reachable.insert(rels_norm) {
             continue;
         }
-        let Some(xml) = parts.get(&rels_name) else { continue };
+        let Some(xml) = parts_by_norm.get(&normalize_part_name(&rels_name)) else { continue };
         let source_dir = source_dir_of_rels(&rels_name);
         let mut targets = Vec::new();
         for_each_element(xml, &rels_name, &mut |el| {
@@ -661,20 +881,48 @@ fn scan_orphans(names: &[String], parts: &BTreeMap<String, Vec<u8>>, findings: &
             Ok(())
         })?;
         for target in targets {
-            if name_set.contains(target.as_str())
-                && reachable.insert(target.clone())
-                && let Some(rels) = rels_of_part(&target)
+            let target_norm = normalize_part_name(&target);
+            if let Some(original) = original_by_norm.get(&target_norm)
+                && reachable.insert(target_norm)
+                && let Some(rels) = rels_of_part(original)
             {
                 stack.push(rels);
             }
         }
     }
     for name in names {
-        if !reachable.contains(name) {
+        if !reachable.contains(&normalize_part_name(name)) {
             findings.push(AuditFinding::new(FindingKind::OrphanPart, name.clone(), "no relationship targets this part".to_string()));
         }
     }
     Ok(())
+}
+
+/// The comparison form of a part name: percent-decoded (relationship
+/// targets are URIs, so a space may arrive as `%20`) and ASCII-lowercased
+/// (OPC part names are case-insensitive, ECMA-376 Part 2 §9.1.1).
+fn normalize_part_name(name: &str) -> String {
+    percent_decode(name).to_ascii_lowercase()
+}
+
+/// Decode `%XX` escapes; a `%` not followed by two hex digits stays as-is.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = ((bytes[i + 1] as char).to_digit(16), (bytes[i + 2] as char).to_digit(16))
+        {
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The directory of the part a `*.rels` file describes:
