@@ -77,6 +77,7 @@ fn finding_ids_are_stable() {
         ("author-pii/core-properties", FindingKind::CorePropertiesAuthor),
         ("author-pii/extended-properties", FindingKind::ExtendedProperties),
         ("hidden-text", FindingKind::HiddenText),
+        ("hidden-text/style", FindingKind::StyleHiddenText),
         ("active-content/vba", FindingKind::VbaProject),
         ("active-content/ole", FindingKind::OleEmbedding),
         ("package/orphan-part", FindingKind::OrphanPart),
@@ -121,6 +122,77 @@ fn comment_authors_found() {
     assert_eq!(findings.len(), 2);
     assert!(findings.iter().all(|f| f.id == "author-pii/comment"));
     assert!(findings.iter().any(|f| f.detail.contains("2026-03-01")));
+}
+
+#[test]
+fn comment_body_tracked_changes_found() {
+    // Review case: scanning only `w:comment` attributes misses tracked
+    // changes and hidden text inside the comment body. The body is story
+    // content, so a comment whose only secrets sit in the body must not
+    // report just its author.
+    let comments = format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:comments xmlns:w="{W}">"#,
+            r#"<w:comment w:id="1" w:author="Quill Ramsey"><w:p>"#,
+            r#"<w:ins w:id="2" w:author="Ona Vettel" w:date="2026-03-03T10:00:00Z"><w:r><w:t>Added inside a comment</w:t></w:r></w:ins>"#,
+            r#"<w:r><w:rPr><w:rPrChange w:id="3" w:author="Ona Vettel" w:date="2026-03-03T10:00:00Z"/></w:rPr><w:t>Reformatted inside a comment</w:t></w:r>"#,
+            r#"<w:r><w:rPr><w:vanish/></w:rPr><w:t>Hidden inside a comment</w:t></w:r>"#,
+            r#"</w:p></w:comment></w:comments>"#
+        ),
+        W = W
+    );
+    let rels = doc_rels(
+        r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="comments.xml"/>"#,
+    );
+    let bytes = package(&[
+        ("[Content_Types].xml", &content_types()),
+        ("_rels/.rels", &root_rels()),
+        ("word/document.xml", &plain_paragraph()),
+        ("word/_rels/document.xml.rels", &rels),
+        ("word/comments.xml", &comments.into_bytes()),
+    ]);
+    let findings = findings_of(&bytes);
+    assert_eq!(findings.len(), 4);
+    assert!(findings.iter().any(|f| f.id == "author-pii/comment" && f.detail.contains("Quill Ramsey")));
+    assert!(findings.iter().any(|f| f.id == "author-pii/revision" && f.location == "word/comments.xml <w:ins>" && f.detail.contains("Ona Vettel")));
+    assert!(findings.iter().any(|f| f.id == "author-pii/revision" && f.location == "word/comments.xml <w:rPrChange>"));
+    assert!(findings.iter().any(|f| f.id == "hidden-text" && f.location == "word/comments.xml <w:vanish>"));
+}
+
+#[test]
+fn style_defined_hidden_text_found() {
+    // Review case: `w:vanish` in styles.xml hides text without touching any
+    // run. The "Secret Style" style hides text, the document defaults do,
+    // and "Plain Style" sets `w:val="false"` so it must not be flagged.
+    let styles = format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:styles xmlns:w="{W}">"#,
+            r#"<w:docDefaults><w:rPrDefault><w:rPr><w:vanish/></w:rPr></w:rPrDefault></w:docDefaults>"#,
+            r#"<w:style w:type="character" w:styleId="SecretStyle"><w:name w:val="Secret Style"/><w:rPr><w:vanish/></w:rPr></w:style>"#,
+            r#"<w:style w:type="character" w:styleId="PlainStyle"><w:name w:val="Plain Style"/><w:rPr><w:vanish w:val="false"/></w:rPr></w:style>"#,
+            r#"</w:styles>"#
+        ),
+        W = W
+    );
+    let rels = doc_rels(
+        r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>"#,
+    );
+    let bytes = package(&[
+        ("[Content_Types].xml", &content_types()),
+        ("_rels/.rels", &root_rels()),
+        ("word/document.xml", &plain_paragraph()),
+        ("word/_rels/document.xml.rels", &rels),
+        ("word/styles.xml", &styles.into_bytes()),
+    ]);
+    let findings = findings_of(&bytes);
+    assert_eq!(findings.len(), 2);
+    assert!(findings.iter().all(|f| f.id == "hidden-text/style" && f.severity == "warn"));
+    assert!(findings.iter().any(|f| f.detail.contains("Secret Style")));
+    assert!(findings.iter().any(|f| f.detail.contains("document default")));
+    // The part is parsed, not merely listed.
+    let report = audit_report(&bytes).unwrap();
+    assert!(report.scanned.contains(&"word/styles.xml".to_string()));
+    assert!(!report.not_scanned.contains(&"word/styles.xml".to_string()));
 }
 
 #[test]

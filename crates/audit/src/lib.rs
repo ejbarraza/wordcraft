@@ -16,9 +16,16 @@
 //!   (ECMA-376 §17.18.67 `ST_OnOff`); `w:val="false"` is not flagged.
 //! - Revisions and hidden text are scanned in every story part:
 //!   `word/document.xml`, `word/header*.xml`, `word/footer*.xml`,
-//!   `word/footnotes.xml` and `word/endnotes.xml`. The report lists the
-//!   parts it scanned and the parts it did not, so "no findings" never
-//!   silently means "not looked at".
+//!   `word/footnotes.xml` and `word/endnotes.xml`. Comment bodies in
+//!   `word/comments.xml` are story content too and are scanned the same
+//!   way, on top of the `w:comment` author attributes.
+//! - `w:vanish` in `word/styles.xml` — in a style's run properties or in
+//!   the document defaults — is reported as a hidden-text style: it hides
+//!   every run the style (or the defaults) applies to. Parts the audit
+//!   does not parse at all (e.g. `word/numbering.xml`, glossary parts)
+//!   are listed under `not_scanned`.
+//! - The report lists the parts it scanned and the parts it did not, so
+//!   "no findings" never silently means "not looked at".
 //! - A `dc:creator` / `cp:lastModifiedBy` value is reported as-is; producers
 //!   that anonymize (WordCraft writes `Author`) are reported too, since the
 //!   value is what a recipient sees.
@@ -83,6 +90,9 @@ pub enum FindingKind {
     ExtendedProperties,
     /// A `w:vanish` run property (ECMA-376 §17.3.2.42): text that renders hidden.
     HiddenText,
+    /// A `w:vanish` in `word/styles.xml` — a style's run properties or the
+    /// document defaults: every run the style applies to renders hidden.
+    StyleHiddenText,
     /// A VBA macro project part (by relationship type, or `word/vbaProject.bin`):
     /// the document carries macros.
     VbaProject,
@@ -103,6 +113,7 @@ impl FindingKind {
             FindingKind::CorePropertiesAuthor => "author-pii/core-properties",
             FindingKind::ExtendedProperties => "author-pii/extended-properties",
             FindingKind::HiddenText => "hidden-text",
+            FindingKind::StyleHiddenText => "hidden-text/style",
             FindingKind::VbaProject => "active-content/vba",
             FindingKind::OleEmbedding => "active-content/ole",
             FindingKind::OrphanPart => "package/orphan-part",
@@ -118,6 +129,7 @@ impl FindingKind {
             FindingKind::CorePropertiesAuthor => "author name in document properties",
             FindingKind::ExtendedProperties => "organization name in extended properties",
             FindingKind::HiddenText => "hidden text",
+            FindingKind::StyleHiddenText => "hidden text style",
             FindingKind::VbaProject => "VBA macro project",
             FindingKind::OleEmbedding => "embedded object",
             FindingKind::OrphanPart => "orphan package part",
@@ -236,9 +248,16 @@ pub fn audit_report(bytes: &[u8]) -> Result<AuditReport, AuditError> {
     }
     if let Some(xml) = parts.get("word/comments.xml") {
         scan_comments(xml, &mut findings)?;
+        // Comment bodies are story content: tracked changes and hidden
+        // text inside a comment are findings like anywhere else, and
+        // `scan_comments` alone (attributes only) would miss them.
+        scan_story_part(xml, "word/comments.xml", &mut findings)?;
     }
     if let Some(xml) = parts.get("word/people.xml") {
         scan_people(xml, &mut findings)?;
+    }
+    if let Some(xml) = parts.get("word/styles.xml") {
+        scan_styles(xml, &mut findings)?;
     }
     if let Some(xml) = parts.get("docProps/core.xml") {
         scan_core_properties(xml, &mut findings)?;
@@ -264,6 +283,7 @@ fn is_scanned_part(name: &str) -> bool {
     is_story_part(name)
         || name == "word/comments.xml"
         || name == "word/people.xml"
+        || name == "word/styles.xml"
         || name == "docProps/core.xml"
         || name == "docProps/app.xml"
         || name == "docProps/custom.xml"
@@ -572,8 +592,18 @@ const REVISION_ELEMENTS: &[&str] = &[
     "numberingChange",
 ];
 
+/// `CT_OnOff` semantics (ECMA-376 §17.18.67): an absent `w:val` means the
+/// property is on; only an explicit false-ish value turns it off.
+fn on_off_enabled(el: &Element) -> bool {
+    match attr(el, NS_W, "val") {
+        None => true,
+        Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "false" | "off" | "0" | "f" | "no"),
+    }
+}
+
 /// Author-bearing revision elements and `w:vanish` runs in one story part
-/// (`word/document.xml`, a header/footer, footnotes or endnotes).
+/// (`word/document.xml`, a header/footer, footnotes, endnotes, or a comment
+/// body in `word/comments.xml`).
 fn scan_story_part(xml: &[u8], part: &str, findings: &mut Vec<AuditFinding>) -> Result<(), AuditError> {
     for_each_element(xml, part, &mut |el| {
         if el.ns.as_slice() != NS_W {
@@ -593,16 +623,10 @@ fn scan_story_part(xml: &[u8], part: &str, findings: &mut Vec<AuditFinding>) -> 
             }
             return Ok(());
         }
-        // ECMA-376 §17.3.2.42 `CT_OnOff`: absent `w:val` means on; only an
-        // explicit false-ish value means the text is not hidden.
-        if el.local == "vanish" {
-            let hidden = match attr(el, NS_W, "val") {
-                None => true,
-                Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "false" | "off" | "0" | "f" | "no"),
-            };
-            if hidden {
-                findings.push(AuditFinding::new(FindingKind::HiddenText, format!("{part} <w:vanish>"), "run property hides text".to_string()));
-            }
+        // ECMA-376 §17.3.2.42: `w:vanish` hides the run unless its `w:val`
+        // explicitly turns it off.
+        if el.local == "vanish" && on_off_enabled(el) {
+            findings.push(AuditFinding::new(FindingKind::HiddenText, format!("{part} <w:vanish>"), "run property hides text".to_string()));
         }
         Ok(())
     })
@@ -631,6 +655,150 @@ fn scan_comments(xml: &[u8], findings: &mut Vec<AuditFinding>) -> Result<(), Aud
         }
         Ok(())
     })
+}
+
+/// The `w:style` element [`scan_styles`] is currently inside, if any.
+struct StyleContext {
+    /// Open-element depth at which the style started; the style ends when
+    /// the walker's depth drops below this.
+    depth: u32,
+    style_id: String,
+    /// The style's display name, once its `w:name` child has been seen.
+    name: Option<String>,
+}
+
+/// What a `w:vanish` in `word/styles.xml` hides, given the walk state.
+fn style_vanish_detail(style: &Option<StyleContext>, in_defaults: bool) -> String {
+    match style {
+        Some(ctx) => {
+            let label = ctx.name.as_deref().filter(|n| !n.is_empty()).unwrap_or(ctx.style_id.as_str());
+            if label.is_empty() { "a style's run properties hide text".to_string() } else { format!("style \"{label}\" run properties hide text") }
+        }
+        None if in_defaults => "document default run properties hide text".to_string(),
+        None => "run properties hide text".to_string(),
+    }
+}
+
+/// The leaf elements [`scan_styles`] acts on inside a style or the document
+/// defaults: a style's `w:name` (which labels later findings) and `w:vanish`
+/// (the finding itself).
+fn scan_styles_leaf(el: &Element, style: &mut Option<StyleContext>, in_defaults: bool, findings: &mut Vec<AuditFinding>) {
+    match el.local.as_str() {
+        "name" => {
+            if let Some(ctx) = style
+                && ctx.name.is_none()
+                && let Some(v) = attr(el, NS_W, "val")
+            {
+                ctx.name = Some(v.to_string());
+            }
+        }
+        "vanish" if on_off_enabled(el) => {
+            findings.push(AuditFinding::new(
+                FindingKind::StyleHiddenText,
+                "word/styles.xml <w:vanish>".to_string(),
+                style_vanish_detail(style, in_defaults),
+            ));
+        }
+        _ => {}
+    }
+}
+
+/// `w:vanish` in `word/styles.xml`: a style whose run properties hide text
+/// hides every run that uses the style, and document defaults
+/// (`w:docDefaults`) hide every run that does not override them. Neither is
+/// visible in the rendered document, so both are findings. The walk tracks
+/// the enclosing `w:style` so the finding can name it; unlike
+/// [`for_each_element`] it needs end tags, so it drives its own reader (the
+/// same bookkeeping as [`texts_of`]).
+fn scan_styles(xml: &[u8], findings: &mut Vec<AuditFinding>) -> Result<(), AuditError> {
+    let part = "word/styles.xml";
+    let mut reader = NsReader::from_reader(xml);
+    {
+        let config = reader.config_mut();
+        config.trim_text_start = false;
+        config.trim_text_end = false;
+        config.expand_empty_elements = false;
+        // See `for_each_element`: malformed parts fail the audit.
+        config.check_end_names = true;
+    }
+    let mut buf = Vec::new();
+    let mut count: u64 = 0;
+    let mut open: u32 = 0;
+    let mut root_seen = false;
+    let mut style: Option<StyleContext> = None;
+    // Open-element depth of `w:docDefaults`, while inside it.
+    let mut defaults: Option<u32> = None;
+    loop {
+        buf.clear();
+        let (resolution, event) = reader.read_resolved_event_into(&mut buf).map_err(|e| AuditError::Xml(part.to_string(), e.to_string()))?;
+        // Copy the namespace URI out so the reader borrow ends here; the
+        // attribute resolver in `element_of` needs `&mut reader` again.
+        let ns: Vec<u8> = match &resolution {
+            ResolveResult::Bound(n) => n.0.to_vec(),
+            _ => Vec::new(),
+        };
+        match event {
+            Event::Start(ref e) => {
+                if open == 0 {
+                    if root_seen {
+                        return Err(AuditError::Xml(part.to_string(), "multiple root elements".to_string()));
+                    }
+                    root_seen = true;
+                }
+                open = open.saturating_add(1);
+                count += 1;
+                if count > MAX_XML_ELEMENTS {
+                    return Err(AuditError::Limit(format!("{part}: too many XML elements")));
+                }
+                let el = element_of(&mut reader, &ns, e, part)?;
+                if el.ns.as_slice() == NS_W {
+                    match el.local.as_str() {
+                        "style" => {
+                            style = Some(StyleContext { depth: open, style_id: attr(&el, NS_W, "styleId").unwrap_or("").to_string(), name: None });
+                        }
+                        "docDefaults" => defaults = Some(open),
+                        _ => scan_styles_leaf(&el, &mut style, defaults.is_some(), findings),
+                    }
+                }
+            }
+            Event::Empty(ref e) => {
+                if open == 0 {
+                    if root_seen {
+                        return Err(AuditError::Xml(part.to_string(), "multiple root elements".to_string()));
+                    }
+                    root_seen = true;
+                }
+                count += 1;
+                if count > MAX_XML_ELEMENTS {
+                    return Err(AuditError::Limit(format!("{part}: too many XML elements")));
+                }
+                let el = element_of(&mut reader, &ns, e, part)?;
+                if el.ns.as_slice() == NS_W {
+                    scan_styles_leaf(&el, &mut style, defaults.is_some(), findings);
+                }
+            }
+            Event::End(_) => {
+                open = open.saturating_sub(1);
+                if style.as_ref().is_some_and(|ctx| open < ctx.depth) {
+                    style = None;
+                }
+                if defaults.is_some_and(|depth| open < depth) {
+                    defaults = None;
+                }
+            }
+            Event::Eof => {
+                if open != 0 {
+                    return Err(AuditError::Xml(part.to_string(), "unclosed elements at end of part".to_string()));
+                }
+                if !root_seen {
+                    return Err(AuditError::Xml(part.to_string(), "no root element".to_string()));
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// `w15:person` author names in `word/people.xml`: the roster Word keeps of
